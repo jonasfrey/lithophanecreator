@@ -79,29 +79,47 @@ impl Camera {
     }
 }
 
-/// Flattens meshes into a non-indexed vertex buffer with face normals.
-pub fn vertex_data(meshes: &[(&Mesh, f32)]) -> Vec<f32> {
-    let count: usize = meshes.iter().map(|(m, _)| m.triangles.len() * 3).sum();
-    let mut out = Vec::with_capacity(count * STRIDE + 6 * STRIDE);
-    let mut lo = Vec3::splat(f32::INFINITY);
-    let mut hi = Vec3::splat(f32::NEG_INFINITY);
-    for (mesh, kind) in meshes {
+/// Vertex buffer contents and the draw calls that place the meshes.
+pub struct SceneData {
+    vertices: Vec<f32>,
+    /// First vertex, vertex count and offset of each draw call.
+    draws: Vec<(i32, i32, Vec3)>,
+    pub bounds: Option<(Vec3, Vec3)>,
+}
+
+/// Flattens meshes into a non-indexed vertex buffer with face normals. Each mesh is stored
+/// once and drawn at each of its offsets, with a build plate under everything.
+pub fn scene_data(meshes: &[(&Mesh, f32, &[Vec3])]) -> SceneData {
+    let count: usize = meshes.iter().map(|(m, _, _)| m.triangles.len() * 3).sum();
+    let mut vertices = Vec::with_capacity(count * STRIDE + 6 * STRIDE);
+    let mut draws = Vec::new();
+    let mut bounds: Option<(Vec3, Vec3)> = None;
+    for (mesh, kind, offsets) in meshes {
+        let first = vertices.len() / STRIDE;
         for t in &mesh.triangles {
             let n = mesh.triangle_normal(t).as_vec3();
             for &v in t {
                 let p = mesh.positions[v as usize];
-                lo = lo.min(Vec3::from(p));
-                hi = hi.max(Vec3::from(p));
                 let thickness = mesh.attr.get(v as usize).copied().unwrap_or(-1.0);
-                out.extend_from_slice(&[p[0], p[1], p[2], n.x, n.y, n.z, *kind, thickness]);
+                vertices.extend_from_slice(&[p[0], p[1], p[2], n.x, n.y, n.z, *kind, thickness]);
             }
         }
+        let n = vertices.len() / STRIDE - first;
+        let Some((lo, hi)) = mesh.bbox().filter(|_| n > 0) else {
+            continue;
+        };
+        for &o in offsets.iter() {
+            let (lo, hi) = (lo.as_vec3() + o, hi.as_vec3() + o);
+            bounds = Some(bounds.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
+            draws.push((first as i32, n as i32, o));
+        }
     }
-    if lo.x.is_finite() {
+    if let Some((lo, hi)) = bounds {
         // Build plate under the model.
         let m = (hi - lo).max_element() * 0.15 + 10.0;
         let (a, b) = (lo - Vec3::splat(m), hi + Vec3::splat(m));
         let z = -0.05;
+        draws.push(((vertices.len() / STRIDE) as i32, 6, Vec3::ZERO));
         for (x, y) in [
             (a.x, a.y),
             (b.x, a.y),
@@ -110,18 +128,14 @@ pub fn vertex_data(meshes: &[(&Mesh, f32)]) -> Vec<f32> {
             (b.x, b.y),
             (a.x, b.y),
         ] {
-            out.extend_from_slice(&[x, y, z, 0.0, 0.0, 1.0, KIND_BED, -1.0]);
+            vertices.extend_from_slice(&[x, y, z, 0.0, 0.0, 1.0, KIND_BED, -1.0]);
         }
     }
-    out
-}
-
-pub fn mesh_bounds(meshes: &[&Mesh]) -> Option<(Vec3, Vec3)> {
-    meshes
-        .iter()
-        .filter_map(|m| m.bbox())
-        .map(|(a, b)| (a.as_vec3(), b.as_vec3()))
-        .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+    SceneData {
+        vertices,
+        draws,
+        bounds,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -137,15 +151,15 @@ pub struct Scene {
     program: Option<glow::Program>,
     vao: Option<glow::VertexArray>,
     vbo: Option<glow::Buffer>,
-    vertex_count: i32,
-    pending: Option<Vec<f32>>,
+    draws: Vec<(i32, i32, Vec3)>,
+    pending: Option<SceneData>,
     pub error: Option<String>,
 }
 
 pub type SharedScene = Arc<Mutex<Scene>>;
 
 impl Scene {
-    pub fn set_vertices(&mut self, data: Vec<f32>) {
+    pub fn set_data(&mut self, data: SceneData) {
         self.pending = Some(data);
     }
 
@@ -170,14 +184,15 @@ impl Scene {
             in vec3 a_normal;
             in vec2 a_attr;
             uniform mat4 u_view_proj;
+            uniform vec3 u_offset;
             out vec3 v_normal;
             out vec3 v_pos;
             out vec2 v_attr;
             void main() {
                 v_normal = a_normal;
-                v_pos = a_pos;
+                v_pos = a_pos + u_offset;
                 v_attr = a_attr;
-                gl_Position = u_view_proj * vec4(a_pos, 1.0);
+                gl_Position = u_view_proj * vec4(v_pos, 1.0);
             }
         "#;
         let fs = r#"
@@ -277,12 +292,13 @@ impl Scene {
         unsafe {
             if let Some(data) = self.pending.take() {
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-                let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4);
+                let v = &data.vertices;
+                let bytes = std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4);
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
                 gl.bind_buffer(glow::ARRAY_BUFFER, None);
-                self.vertex_count = (data.len() / STRIDE) as i32;
+                self.draws = data.draws;
             }
-            if self.vertex_count == 0 {
+            if self.draws.is_empty() {
                 return;
             }
             gl.enable(glow::DEPTH_TEST);
@@ -303,7 +319,11 @@ impl Scene {
             gl.uniform_1_f32(loc("u_backlit").as_ref(), if u.backlit { 1.0 } else { 0.0 });
             gl.uniform_2_f32(loc("u_t_range").as_ref(), u.t_range[0], u.t_range[1]);
             gl.bind_vertex_array(Some(vao));
-            gl.draw_arrays(glow::TRIANGLES, 0, self.vertex_count);
+            let offset = loc("u_offset");
+            for &(first, count, o) in &self.draws {
+                gl.uniform_3_f32(offset.as_ref(), o.x, o.y, o.z);
+                gl.draw_arrays(glow::TRIANGLES, first, count);
+            }
             gl.bind_vertex_array(None);
             gl.disable(glow::DEPTH_TEST);
         }

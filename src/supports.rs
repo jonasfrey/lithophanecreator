@@ -7,6 +7,11 @@
 //! Here the two foot plates of a side are joined around the end of the plate,
 //! so every side is one support part.
 //!
+//! Several identical lithophanes can stand one behind the other. The buttresses then
+//! stand on the front of the first and the back of the last one, a full-height spacer
+//! fills each gap in between, and the foot reaches under the spacers like a comb, so
+//! there are still two support parts.
+//!
 //! For outlines without a flat bottom, a "cradle" fills the space between the bed
 //! and the lower edge of the outline (with a small gap, like slicer support), and
 //! is split into a left and a right half that belong to the two support parts.
@@ -220,16 +225,30 @@ fn cradle_loops(shape: &Shape, gap: f64) -> [Vec<Vec<DVec2>>; 2] {
     out
 }
 
-/// Builds the left and right support parts.
+/// Builds the left and right support parts for `count` lithophanes. The first one fills
+/// -max_thickness <= y <= 0, each further one stands `spacing` behind the previous one.
 pub fn build(
     shape: &Shape,
     plan: &[SidePlan; 2],
     max_thickness: f64,
+    count: usize,
+    spacing: f64,
     p: &SupportParams,
 ) -> [Mesh; 2] {
     let size = shape.size();
     let tm = max_thickness;
     let cg = p.contact_gap.max(0.0);
+    let count = count.max(1);
+    let pitch = tm + spacing;
+    // Back face of the last lithophane.
+    let back = (count - 1) as f64 * pitch;
+    // Each gap between neighbours: back face of the one, front face of the next.
+    let gaps: Vec<(f64, f64)> = (1..count)
+        .map(|k| ((k - 1) as f64 * pitch, k as f64 * pitch - tm))
+        .collect();
+    let spacer_gap = cg.min(0.5 * spacing - 0.1).max(0.0);
+    // Foot teeth keep the foot gap to the lithophanes if the gap leaves them 1 mm.
+    let tooth_gap = p.foot_gap.min(0.5 * (spacing - 1.0)).max(spacer_gap);
     let cradles = if p.cradle {
         cradle_loops(shape, p.cradle_gap.max(0.05))
     } else {
@@ -248,8 +267,10 @@ pub fn build(
             (s.x1, s.x0)
         };
         // Distance `d` from the plate on the back (+Y) and front (-Y) face.
-        let faces: [Box<dyn Fn(f64) -> f64>; 2] =
-            [Box::new(move |d| cg + d), Box::new(move |d| -tm - cg - d)];
+        let faces: [Box<dyn Fn(f64) -> f64>; 2] = [
+            Box::new(move |d| back + cg + d),
+            Box::new(move |d| -tm - cg - d),
+        ];
 
         let wall = vec![vec![
             DVec2::new(0.0, 0.0),
@@ -261,6 +282,17 @@ pub fn build(
         for y in &faces {
             part.append(&extrude(&wall, s.x0, s.x1, |q, w| {
                 DVec3::new(w, y(q.x), q.y)
+            }));
+        }
+        for &(ya, yb) in &gaps {
+            let spacer = vec![vec![
+                DVec2::new(ya + spacer_gap, 0.0),
+                DVec2::new(yb - spacer_gap, 0.0),
+                DVec2::new(yb - spacer_gap, h),
+                DVec2::new(ya + spacer_gap, h),
+            ]];
+            part.append(&extrude(&spacer, s.x0, s.x1, |q, w| {
+                DVec3::new(w, q.x, q.y)
             }));
         }
 
@@ -288,7 +320,8 @@ pub fn build(
             }
         }
 
-        // Foot plate: one "C" shape around the end of the plate, joining both faces.
+        // Foot plate: one "C" shape around the end of the plates, joining both faces,
+        // with a tooth under each spacer.
         let bridge = 3.0;
         let foot_len = depth + p.foot_extra;
         let reach = p
@@ -302,27 +335,42 @@ pub fn build(
         };
         let xi = x_outer + s.sign * reach;
         let (yf_out, yf_in) = (-tm - cg - foot_len, -tm - p.foot_gap);
-        let (yb_in, yb_out) = (p.foot_gap, cg + foot_len);
-        let foot = vec![vec![
+        let (yb_in, yb_out) = (back + p.foot_gap, back + cg + foot_len);
+        let mut foot = vec![
             DVec2::new(xo, yf_out),
             DVec2::new(xi, yf_out),
             DVec2::new(xi, yf_in),
             DVec2::new(xb, yf_in),
+        ];
+        for &(ya, yb) in &gaps {
+            let (ya, yb) = (ya + tooth_gap, yb - tooth_gap);
+            foot.extend([
+                DVec2::new(xb, ya),
+                DVec2::new(x_inner, ya),
+                DVec2::new(x_inner, yb),
+                DVec2::new(xb, yb),
+            ]);
+        }
+        foot.extend([
             DVec2::new(xb, yb_in),
             DVec2::new(xi, yb_in),
             DVec2::new(xi, yb_out),
             DVec2::new(xo, yb_out),
-        ]];
-        part.append(&extrude(&foot, 0.0, p.foot_thickness.max(0.1), |q, w| {
+        ]);
+        part.append(&extrude(&[foot], 0.0, p.foot_thickness.max(0.1), |q, w| {
             DVec3::new(q.x, q.y, w)
         }));
 
-        // Cradle pieces sit inside the plate's slab and reach slightly into the walls.
+        // Cradle pieces sit inside each plate's slab and reach slightly into the walls.
         if !cradles[side].is_empty() {
-            let (y0, y1) = (-tm - cg - 0.05, cg + 0.05);
-            part.append(&extrude(&cradles[side], y0, y1, |q, w| {
+            let cradle = extrude(&cradles[side], -tm - cg - 0.05, cg + 0.05, |q, w| {
                 DVec3::new(q.x, w, q.y)
-            }));
+            });
+            for k in 0..count {
+                let mut c = cradle.clone();
+                c.translate(DVec3::new(0.0, k as f64 * pitch, 0.0));
+                part.append(&c);
+            }
         }
     }
     parts
@@ -340,7 +388,7 @@ mod tests {
         assert!(plan[0].x0.abs() < 1e-9 && (plan[0].x1 - 0.8).abs() < 1e-9);
         assert!((plan[1].x1 - 108.0).abs() < 1e-9);
         assert!((plan[0].height - 144.0).abs() < 1e-9);
-        let parts = build(&shape, &plan, 3.2, &p);
+        let parts = build(&shape, &plan, 3.2, 1, 3.0, &p);
         for part in &parts {
             let (lo, hi) = part.bbox().unwrap();
             assert!(lo.z.abs() < 1e-6 && (hi.z - 144.0).abs() < 1e-4);
@@ -374,7 +422,7 @@ mod tests {
                 }
             }
         }
-        let parts = build(&shape, &plan, 3.2, &p);
+        let parts = build(&shape, &plan, 3.2, 1, 3.0, &p);
         assert!(parts.iter().all(|m| !m.triangles.is_empty()));
     }
 
@@ -408,8 +456,69 @@ mod tests {
             let p = SupportParams::default();
             let plan = plan(&shape, &p).unwrap();
             assert!((plan[0].x0 - (w - plan[1].x1)).abs() < 1e-9);
-            let [left, right] = build(&shape, &plan, 3.2, &p);
-            assert_eq!(vertex_set(&left, None), vertex_set(&right, Some(w)));
+            for count in [1, 3] {
+                let [left, right] = build(&shape, &plan, 3.2, count, 3.0, &p);
+                assert_eq!(vertex_set(&left, None), vertex_set(&right, Some(w)));
+            }
+        }
+    }
+
+    #[test]
+    fn several_lithophanes_share_two_support_parts() {
+        let (tm, spacing, count) = (3.2, 3.0, 4);
+        let pitch = tm + spacing;
+        let has_vertex = |m: &Mesh, q: DVec3| {
+            m.positions
+                .iter()
+                .any(|v| (DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64) - q).length() < 1e-4)
+        };
+        for shape in [
+            Shape::rectangle(108.0, 144.0, 0.0),
+            Shape::ellipse(100.0, 80.0),
+        ] {
+            let size = shape.size();
+            let p = SupportParams::default();
+            let plan = plan(&shape, &p).unwrap();
+            let single = build(&shape, &plan, tm, 1, spacing, &p);
+            let parts = build(&shape, &plan, tm, count, spacing, &p);
+            for ((part, one), s) in parts.iter().zip(&single).zip(&plan) {
+                // The buttresses move to the front of the first and the back of the last plate.
+                let (lo, hi) = part.bbox().unwrap();
+                let (lo1, hi1) = one.bbox().unwrap();
+                assert!((lo.y - lo1.y).abs() < 1e-4 && (lo.z - lo1.z).abs() < 1e-6);
+                assert!((hi.y - hi1.y - (count - 1) as f64 * pitch).abs() < 1e-4);
+                assert!((hi.z - hi1.z).abs() < 1e-6);
+                // A full-height spacer in each gap, on a tooth of the foot.
+                let x_inner = if s.sign > 0.0 { s.x1 } else { s.x0 };
+                for k in 1..count {
+                    let (ya, yb) = ((k - 1) as f64 * pitch, k as f64 * pitch - tm);
+                    let cg = p.contact_gap;
+                    assert!(has_vertex(part, DVec3::new(s.x0, ya + cg, s.height)));
+                    assert!(has_vertex(part, DVec3::new(s.x1, yb - cg, 0.0)));
+                    assert!(has_vertex(
+                        part,
+                        DVec3::new(x_inner, ya + 1.0, p.foot_thickness)
+                    ));
+                    assert!(has_vertex(
+                        part,
+                        DVec3::new(x_inner, yb - 1.0, p.foot_thickness)
+                    ));
+                }
+                // Nothing but the cradle (whose ends lie outside) cuts through a plate.
+                for v in &part.positions {
+                    let (x, y) = (v[0] as f64, v[1] as f64);
+                    if x <= 0.0 || x >= size.x {
+                        continue;
+                    }
+                    for k in 0..count {
+                        let back = k as f64 * pitch;
+                        assert!(
+                            y <= back - tm + 1e-4 || y >= back - 1e-4,
+                            "support vertex {v:?} inside plate {k}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

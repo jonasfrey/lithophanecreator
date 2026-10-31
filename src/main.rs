@@ -30,6 +30,8 @@ Options:
   --res <mm>             relief grid spacing, default 0.2
   --min <mm> --max <mm>  thickness range, default 0.8 / 3.2
   --border <mm>          solid rim width, default 2
+  --count <n>            number of lithophanes standing one behind the other, 1-10, default 1
+  --spacing <mm>         gap between neighbouring lithophanes, default 3
   --no-supports          only export the lithophane
   --separate             also write one STL per part
   --preview <file.png>   also save a simulated backlit view
@@ -120,6 +122,14 @@ fn run_cli(args: &[String]) -> Result<(), String> {
             "--min" => s.litho.min_thickness = number(a)?,
             "--max" => s.litho.max_thickness = number(a)?,
             "--border" => s.litho.border_width = number(a)?,
+            "--count" => {
+                let n = number(a)?;
+                if n.fract() != 0.0 || !(1.0..=model::MAX_COUNT as f64).contains(&n) {
+                    return Err(format!("--count must be 1 to {}", model::MAX_COUNT));
+                }
+                s.layout.count = n as u32;
+            }
+            "--spacing" => s.layout.spacing = number(a)?,
             "--no-supports" => s.supports.enabled = false,
             "--separate" => s.separate_files = true,
             "--preview" => preview = Some(value(a)?.into()),
@@ -152,6 +162,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         adjustments: s.adjustments,
         litho: s.litho.clone(),
         supports: s.supports.clone(),
+        layout: s.layout,
     };
     let t0 = std::time::Instant::now();
     let m = model::build_model(&input, s.resolution);

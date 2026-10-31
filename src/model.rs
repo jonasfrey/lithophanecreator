@@ -1,4 +1,4 @@
-//! Settings and assembly of the printable model (lithophane + two support parts).
+//! Settings and assembly of the printable model (lithophanes + two support parts).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,6 +51,28 @@ impl Default for ShapeSettings {
     }
 }
 
+pub const MAX_COUNT: u32 = 10;
+const MIN_SPACING: f64 = 1.0;
+
+/// Identical lithophanes standing one behind the other, sharing the two support parts.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Layout {
+    /// Number of lithophanes, 1 to `MAX_COUNT`.
+    pub count: u32,
+    /// Gap between the full-thickness faces of neighbouring lithophanes in mm.
+    pub spacing: f64,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Layout {
+            count: 1,
+            spacing: 3.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -62,6 +84,7 @@ pub struct Settings {
     pub adjustments: Adjustments,
     pub litho: LithoParams,
     pub supports: SupportParams,
+    pub layout: Layout,
     /// Grid spacing of the exported relief in mm.
     pub resolution: f64,
     /// Also write each part to its own STL next to the combined one.
@@ -77,6 +100,7 @@ impl Default for Settings {
             adjustments: Adjustments::default(),
             litho: LithoParams::default(),
             supports: SupportParams::default(),
+            layout: Layout::default(),
             resolution: 0.2,
             separate_files: false,
         }
@@ -91,17 +115,21 @@ pub struct BuildInput {
     pub adjustments: Adjustments,
     pub litho: LithoParams,
     pub supports: SupportParams,
+    pub layout: Layout,
 }
 
 pub struct Model {
+    /// The first lithophane; the others are copies of it.
     pub lithophane: Mesh,
+    /// Offset of each lithophane (the first one's is zero).
+    pub copies: Vec<DVec3>,
     pub supports: Vec<Mesh>,
     pub heightmap: Heightmap,
 }
 
 impl Model {
     pub fn triangle_count(&self) -> usize {
-        self.lithophane.triangles.len()
+        self.lithophane.triangles.len() * self.copies.len()
             + self
                 .supports
                 .iter()
@@ -109,11 +137,24 @@ impl Model {
                 .sum::<usize>()
     }
 
-    pub fn parts(&self) -> Vec<(&'static str, &Mesh)> {
-        let mut v = vec![("lithophane", &self.lithophane)];
+    /// Name, mesh and offset of every printed body.
+    pub fn parts(&self) -> Vec<(String, &Mesh, DVec3)> {
+        let mut v: Vec<(String, &Mesh, DVec3)> = self
+            .copies
+            .iter()
+            .enumerate()
+            .map(|(k, &at)| {
+                let name = if self.copies.len() == 1 {
+                    "lithophane".to_owned()
+                } else {
+                    format!("lithophane_{}", k + 1)
+                };
+                (name, &self.lithophane, at)
+            })
+            .collect();
         let names = ["support_left", "support_right"];
         for (k, m) in self.supports.iter().enumerate() {
-            v.push((names[k.min(1)], m));
+            v.push((names[k.min(1)].to_owned(), m, DVec3::ZERO));
         }
         v
     }
@@ -129,19 +170,36 @@ pub fn build_model(input: &BuildInput, resolution: f64) -> Model {
     let strips = supports::contact_strips(&plan);
     let heightmap = build_heightmap(shape, &image, &litho, resolution, &strips);
     let mut lithophane = mesh_heightmap(&heightmap, shape);
+    let count = input.layout.count.clamp(1, MAX_COUNT) as usize;
+    let spacing = input.layout.spacing.max(MIN_SPACING);
     let mut parts: Vec<Mesh> = match &plan {
-        Some(plan) => supports::build(shape, plan, litho.max_thickness, &input.supports).into(),
+        Some(plan) => supports::build(
+            shape,
+            plan,
+            litho.max_thickness,
+            count,
+            spacing,
+            &input.supports,
+        )
+        .into(),
         None => Vec::new(),
     };
-    // Centre on the build plate, plate's mid-plane on y = 0.
+    // The lithophanes stand one behind the other along +Y.
+    let pitch = litho.max_thickness + spacing;
+    let copies = (0..count)
+        .map(|k| DVec3::new(0.0, k as f64 * pitch, 0.0))
+        .collect();
+    // Centre on the build plate, the row's mid-plane on y = 0.
     let size = shape.size();
-    let shift = DVec3::new(-0.5 * size.x, 0.5 * litho.max_thickness, 0.0);
+    let depth = litho.max_thickness + (count - 1) as f64 * pitch;
+    let shift = DVec3::new(-0.5 * size.x, litho.max_thickness - 0.5 * depth, 0.0);
     lithophane.translate(shift);
     for m in &mut parts {
         m.translate(shift);
     }
     Model {
         lithophane,
+        copies,
         supports: parts,
         heightmap,
     }
@@ -149,7 +207,11 @@ pub fn build_model(input: &BuildInput, resolution: f64) -> Model {
 
 /// Writes the combined STL (and optionally one file per part). Returns the written paths.
 pub fn export(model: &Model, path: &Path, separate: bool) -> std::io::Result<Vec<PathBuf>> {
-    let meshes: Vec<&Mesh> = model.parts().into_iter().map(|(_, m)| m).collect();
+    let meshes: Vec<(&Mesh, DVec3)> = model
+        .parts()
+        .into_iter()
+        .map(|(_, m, at)| (m, at))
+        .collect();
     write_stl(path, &meshes)?;
     let mut written = vec![path.to_path_buf()];
     if separate {
@@ -157,9 +219,9 @@ pub fn export(model: &Model, path: &Path, separate: bool) -> std::io::Result<Vec
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("lithophane");
-        for (name, mesh) in model.parts() {
+        for (name, mesh, at) in model.parts() {
             let p = path.with_file_name(format!("{stem}_{name}.stl"));
-            write_stl(&p, &[mesh])?;
+            write_stl(&p, &[(mesh, at)])?;
             written.push(p);
         }
     }
@@ -226,19 +288,23 @@ pub fn test_pattern() -> GrayImage {
 mod tests {
     use super::*;
 
-    #[test]
-    fn full_model_for_example_dimensions() {
-        let settings = Settings::default();
+    fn input(settings: &Settings) -> BuildInput {
         let (shape, _) = make_shape(&settings.shape, None).unwrap();
-        let input = BuildInput {
+        BuildInput {
             shape: Arc::new(shape),
             image: Arc::new(test_pattern()),
             adjustments: settings.adjustments,
             litho: settings.litho.clone(),
             supports: settings.supports.clone(),
-        };
-        let model = build_model(&input, 1.0);
+            layout: settings.layout,
+        }
+    }
+
+    #[test]
+    fn full_model_for_example_dimensions() {
+        let model = build_model(&input(&Settings::default()), 1.0);
         assert_eq!(model.lithophane.open_edge_count(), 0);
+        assert_eq!(model.copies, [DVec3::ZERO]);
         assert_eq!(model.supports.len(), 2);
         let (lo, hi) = model.lithophane.bbox().unwrap();
         assert!((hi.x - lo.x - 108.0).abs() < 0.6);
@@ -247,5 +313,66 @@ mod tests {
         // Supports must not overlap the plate's slab except through the contact gap.
         let (slo, shi) = model.supports[0].bbox().unwrap();
         assert!(slo.z.abs() < 1e-6 && shi.z <= hi.z + 1e-4);
+    }
+
+    #[test]
+    fn several_lithophanes_stand_centred_behind_each_other() {
+        let settings = Settings {
+            layout: Layout {
+                count: 3,
+                spacing: 4.0,
+            },
+            ..Settings::default()
+        };
+        let model = build_model(&input(&settings), 1.0);
+        let pitch = settings.litho.max_thickness + 4.0;
+        assert_eq!(model.copies.len(), 3);
+        assert!((model.copies[2].y - 2.0 * pitch).abs() < 1e-9);
+        let names: Vec<String> = model.parts().into_iter().map(|(n, _, _)| n).collect();
+        assert_eq!(
+            names,
+            [
+                "lithophane_1",
+                "lithophane_2",
+                "lithophane_3",
+                "support_left",
+                "support_right"
+            ]
+        );
+        let (lo, hi) = model.lithophane.bbox().unwrap();
+        let (front, back) = (lo.y, hi.y + model.copies[2].y);
+        assert!(
+            (front + back).abs() < 1e-4,
+            "row not centred: {front} .. {back}"
+        );
+        assert!((back - front - (settings.litho.max_thickness + 2.0 * pitch)).abs() < 1e-4);
+        let single = build_model(&input(&Settings::default()), 1.0);
+        assert_eq!(
+            model.triangle_count()
+                - model
+                    .supports
+                    .iter()
+                    .map(|m| m.triangles.len())
+                    .sum::<usize>(),
+            3 * single.lithophane.triangles.len()
+        );
+
+        // The STL holds every copy at its place.
+        let dir = std::env::temp_dir().join(format!("litho-model-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("row.stl");
+        let files = export(&model, &path, true).unwrap();
+        assert_eq!(files.len(), 6);
+        assert!(files[3].ends_with("row_lithophane_3.stl"));
+        let tris = crate::mesh::read_stl(&path).unwrap();
+        assert_eq!(tris.len(), model.triangle_count());
+        let max_y = tris
+            .iter()
+            .flatten()
+            .map(|v| v[1] as f64)
+            .fold(f64::MIN, f64::max);
+        let (_, shi) = model.supports[0].bbox().unwrap();
+        assert!((max_y - shi.y).abs() < 1e-3);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

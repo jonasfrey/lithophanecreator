@@ -364,33 +364,29 @@ pub fn extrude(loops: &[Vec<DVec2>], w0: f64, w1: f64, map: impl Fn(DVec2, f64) 
     mesh
 }
 
-/// Writes all meshes into one binary STL file.
-pub fn write_stl(path: &Path, meshes: &[&Mesh]) -> std::io::Result<()> {
+/// Writes all meshes into one binary STL file, each moved by its offset.
+pub fn write_stl(path: &Path, meshes: &[(&Mesh, DVec3)]) -> std::io::Result<()> {
     let file = std::fs::File::create(path)?;
     let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
     let mut header = [0u8; 80];
     let text = b"binary STL - lithophane-creator";
     header[..text.len()].copy_from_slice(text);
     w.write_all(&header)?;
-    let count: usize = meshes.iter().map(|m| m.triangles.len()).sum();
+    let count: usize = meshes.iter().map(|(m, _)| m.triangles.len()).sum();
     w.write_all(&(count as u32).to_le_bytes())?;
     let mut buf = [0u8; 50];
-    for m in meshes {
+    for (m, offset) in meshes {
+        let o = offset.as_vec3();
+        let p = |v: u32| {
+            let q = m.positions[v as usize];
+            [q[0] + o.x, q[1] + o.y, q[2] + o.z]
+        };
         for t in &m.triangles {
             let n = m.triangle_normal(t);
+            let [a, b, c] = t.map(p);
             let vals = [
-                n.x as f32,
-                n.y as f32,
-                n.z as f32,
-                m.positions[t[0] as usize][0],
-                m.positions[t[0] as usize][1],
-                m.positions[t[0] as usize][2],
-                m.positions[t[1] as usize][0],
-                m.positions[t[1] as usize][1],
-                m.positions[t[1] as usize][2],
-                m.positions[t[2] as usize][0],
-                m.positions[t[2] as usize][1],
-                m.positions[t[2] as usize][2],
+                n.x as f32, n.y as f32, n.z as f32, a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1],
+                c[2],
             ];
             for (k, v) in vals.iter().enumerate() {
                 buf[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes());
@@ -498,7 +494,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("litho-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rt.stl");
-        write_stl(&path, &[&m]).unwrap();
+        write_stl(&path, &[(&m, DVec3::ZERO)]).unwrap();
         let tris = read_stl(&path).unwrap();
         assert_eq!(tris.len(), m.triangles.len());
         std::fs::remove_dir_all(&dir).ok();

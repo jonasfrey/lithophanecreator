@@ -13,11 +13,11 @@ use glam::{DVec2, Vec3};
 use crate::imaging::{Adjustments, GrayImage, MAX_IMAGE_DIM};
 use crate::lithophane::{Fit, ImageMap, LithoParams};
 use crate::mesh::{earcut_raw, group_loops, triangulate};
-use crate::model::{self, BuildInput, Settings, ShapeKind, ShapeSettings};
+use crate::model::{self, BuildInput, Layout, Settings, ShapeKind, ShapeSettings};
 use crate::project;
 use crate::shape::{AxisChoice, Shape};
 use crate::supports::SupportParams;
-use crate::viewer::{self, Camera, Scene, SharedScene, Uniforms};
+use crate::viewer::{self, Camera, Scene, SceneData, SharedScene, Uniforms};
 
 /// Rough number of heightmap cells used for the interactive preview.
 const PREVIEW_CELLS: f64 = 150_000.0;
@@ -60,13 +60,13 @@ struct BuildKey {
     adjustments: Adjustments,
     litho: LithoParams,
     supports: SupportParams,
+    layout: Layout,
     res: f64,
 }
 
 struct PreviewResult {
     key: BuildKey,
-    vertices: Vec<f32>,
-    bounds: Option<(Vec3, Vec3)>,
+    scene: SceneData,
     backlit: (usize, usize, Vec<u8>),
     triangles: usize,
     millis: u128,
@@ -591,6 +591,7 @@ impl App {
             adjustments: self.s.adjustments,
             litho: self.s.litho.clone(),
             supports: self.s.supports.clone(),
+            layout: self.s.layout,
         }
     }
 
@@ -601,6 +602,7 @@ impl App {
             adjustments: self.s.adjustments,
             litho: self.s.litho.clone(),
             supports: self.s.supports.clone(),
+            layout: self.s.layout,
             res: self.preview_res(),
         }
     }
@@ -609,8 +611,8 @@ impl App {
         if let Some((key, rx)) = &self.job {
             match rx.try_recv() {
                 Ok(r) => {
-                    self.scene.lock().unwrap().set_vertices(r.vertices);
-                    self.last_bounds = r.bounds;
+                    self.last_bounds = r.scene.bounds;
+                    self.scene.lock().unwrap().set_data(r.scene);
                     if self.fit_camera {
                         self.reset_camera();
                     }
@@ -676,16 +678,18 @@ impl App {
         std::thread::spawn(move || {
             let t0 = Instant::now();
             let m = model::build_model(&input, job_key.res);
-            let mut meshes = vec![(&m.lithophane, viewer::KIND_LITHOPHANE)];
-            meshes.extend(m.supports.iter().map(|s| (s, viewer::KIND_SUPPORT)));
-            let vertices = viewer::vertex_data(&meshes);
-            let all: Vec<_> = meshes.iter().map(|(m, _)| *m).collect();
+            let copies: Vec<Vec3> = m.copies.iter().map(|c| c.as_vec3()).collect();
+            let mut meshes = vec![(&m.lithophane, viewer::KIND_LITHOPHANE, &copies[..])];
+            meshes.extend(
+                m.supports
+                    .iter()
+                    .map(|s| (s, viewer::KIND_SUPPORT, &[Vec3::ZERO][..])),
+            );
             let result = PreviewResult {
-                bounds: viewer::mesh_bounds(&all),
+                scene: viewer::scene_data(&meshes),
                 backlit: m.heightmap.backlit_rgba(),
                 triangles: m.triangle_count(),
                 millis: t0.elapsed().as_millis(),
-                vertices,
                 key: job_key,
             };
             tx.send(result).ok();
@@ -1047,7 +1051,21 @@ impl App {
 
     fn litho_controls(&mut self, ui: &mut egui::Ui) {
         let l = &mut self.s.litho;
+        let layout = &mut self.s.layout;
         egui::Grid::new("litho_grid").num_columns(2).show(ui, |ui| {
+            ui.label("Number of lithophanes");
+            ui.add(egui::Slider::new(&mut layout.count, 1..=model::MAX_COUNT));
+            ui.end_row();
+            ui.label("Spacing");
+            ui.add_enabled(
+                layout.count > 1,
+                egui::DragValue::new(&mut layout.spacing)
+                    .range(1.0..=50.0)
+                    .speed(0.05)
+                    .suffix(" mm"),
+            )
+            .on_hover_text("Gap between neighbouring lithophanes (at full thickness)");
+            ui.end_row();
             ui.label("Min thickness (white)");
             ui.add(
                 egui::DragValue::new(&mut l.min_thickness)
@@ -1204,8 +1222,8 @@ impl App {
             "Also save each part as its own STL",
         );
         ui.small(
-            "The STL holds three bodies: the lithophane and the left and right support parts. \
-             Print standing up as exported; snap the supports off afterwards.",
+            "The STL holds the lithophanes and the left and right support parts, each as \
+             its own body. Print standing up as exported; snap the supports off afterwards.",
         );
     }
 

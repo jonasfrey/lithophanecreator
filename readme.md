@@ -46,11 +46,13 @@ project, `.stl` files become the outline, and anything else is loaded as the ima
 2. **Image**: *Open image…*, then adjust lightness, contrast, gamma, black point
    and white point (with a histogram), plus invert, rotate and mirror. Choose cover/contain/stretch,
    then drag and scroll in the *Framing* view to place the picture inside the outline.
-3. **Lithophane**: min thickness (white) and max thickness (black), the width of the solid
-   rim along the outline, and the export grid resolution.
+3. **Lithophane**: the number of lithophanes (1–10, see below) and their spacing,
+   min thickness (white) and max thickness (black), the width of the solid rim along the
+   outline, and the export grid resolution.
 4. **Supports**: see below. All dimensions can be changed.
-5. **Export STL…** writes one binary STL with three bodies: the lithophane and the
-   left and right support parts. Each part can also be saved to its own file.
+5. **Export STL…** writes one binary STL with a body for each lithophane and for the
+   left and right support parts. Each part can also be saved to its own file
+   (`…_lithophane.stl`, or `…_lithophane_1.stl` to `…_lithophane_N.stl` for several).
 
 Views: *Framing* (image placement and the outline), *Backlit preview* (simulated
 transmitted light), and *3D model* (orbit, pan, zoom; can also simulate backlight).
@@ -73,6 +75,7 @@ The window title shows the project name, with `*` while there are unsaved change
 ```sh
 lithophane-creator --image photo.jpg --outline heart.stl --out heart_litho.stl --res 0.2 --preview heart.png
 lithophane-creator --project heart.lithoproj --out heart_litho.stl   # other options override the project
+lithophane-creator --image photo.jpg --out four.stl --count 4 --spacing 3   # four copies in a row
 lithophane-creator --help
 ```
 
@@ -98,6 +101,23 @@ This app builds the same parts, with three generalizations for arbitrary outline
   between the bed and the outline's lower edge. Like slicer support, it keeps a gap
   (default 0.05 mm) below the edge and sideways along slopes. It is split into mirror-image
   left and right halves, one for each support part.
+
+### Several lithophanes
+
+With *Number of lithophanes* above 1, identical copies stand one behind the other, all with
+the relief facing the same way, *Spacing* apart (measured between their full-thickness faces,
+default 3 mm). They still share **two support parts**, which get deeper to hold the whole row:
+
+* the buttress walls stand only on the front of the first and the back of the last lithophane;
+* in each gap between two lithophanes, a full-height spacer wall touches both contact strips
+  (with the contact gap), so the row braces itself;
+* the foot plate reaches under every spacer like a comb. Its teeth keep the foot gap to the
+  lithophanes where the spacing leaves them at least 1 mm, and less otherwise;
+* each lithophane gets its own cradle if the outline needs one.
+
+The lithophane is built once and placed at each position, so the preview stays as fast as for
+one lithophane. The export grows with the count, about 0.8 M triangles per 108 × 144 mm copy at
+0.2 mm.
 
 Overhangs inside the outline that the cradle can't reach (for example inside a "C" shape) still
 need slicer supports.
